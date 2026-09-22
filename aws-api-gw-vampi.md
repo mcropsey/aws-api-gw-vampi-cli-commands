@@ -36,23 +36,42 @@ Example: `curl https://xuitgw7bpb.execute-api.us-east-2.amazonaws.com/mcropsey-l
 | Current deployment | `wu8vmm` (prior: `b25mlv`) |
 | Integrations | root `/` ANY → `http://3.129.249.89:5000/`; `/{proxy+}` ANY → `http://3.129.249.89:5000/{proxy}` |
 
-## Noname / API Security onboarding — REQUIRED
+## Noname / API Security onboarding — REQUIRED (3 steps, **not just the tag**)
 
-> **Gotcha:** Noname (API Security) **skips any API Gateway that has no tags.**
-> Onboarding/selecting an untagged gateway fails with:
+> **Gotcha:** Noname does **NOT** auto-connect a gateway from the tag alone.
+> "Connected" in the Noname UI requires **three** things. The tag is only the
+> **prerequisite** — tagging alone is the trap that left this gateway invisible
+> even though it was tagged. An untagged gateway also fails UI onboarding with:
 >
 >     Member must have length greater than or equal to 1
->
-> **Fix:** the gateway must carry at least one tag. Required key:
-> `inspected-by-noname-security`. The value is ignored (blank is fine).
-> Tag the **API (REST API)** — NOT the stage.
 
-This is **separate** from the CloudFormation connector's `CustomTags` parameter
-(orchestrator stack), which only tags resources the connector *creates* and
-defaults to `{}`. It does **not** satisfy this requirement.
+| # | Piece | Command |
+|---|---|---|
+| 1 | Tag on the **REST API** (prerequisite; blank value OK) | `tag-resource` |
+| 2 | Stage `accessLogSettings` with Noname's `nonameAccessLogs` format → a log group | `update-stage` (patch op) |
+| 3 | `noname-filter` subscription on that log group → your tenant's Kinesis destination | `put-subscription-filter` |
+
+The connector's scanner (`NonameConfiguratorScanner-*`, runs every ~5 min) is
+healthy but does **not** create steps 2–3 by itself — you (or the Noname UI
+"connect" action) must do them. A new **app** behind an already-connected gateway
+is covered automatically; a new **gateway** needs all three steps.
+
+> **Note:** this is separate from the CFN connector's `CustomTags` parameter
+> (orchestrator stack), which only tags resources the connector *creates* and
+> defaults to `{}`. It does **not** satisfy any of the steps above.
+
+Your tenant's destination/role (from `mcropsey-forwarder-stack` +
+`mcropsey-workload-stack`):
+
+- Destination ARN: `arn:aws:logs:us-east-2:491489166083:destination:NonameKinesisCloudWatchLogsDestination-02f9f19d021f`
+- Subscription role: `arn:aws:iam::491489166083:role/NonameCloudWatchKinesisRole-0ab2ef0fa13d`
+
+> **Rule for the future:** every **new API GW** needs all three steps. New
+> apps/backends behind an already-connected gateway are covered automatically.
+
+### Step 1 — tag the REST API (prerequisite)
 
 ```bash
-# add the tag (swap in the new REST API id):
 aws apigateway tag-resource \
   --resource-arn "arn:aws:apigateway:us-east-2::/restapis/<REST_API_ID>" \
   --tags '{"inspected-by-noname-security":""}'
@@ -62,11 +81,62 @@ aws apigateway get-tags \
   --resource-arn "arn:aws:apigateway:us-east-2::/restapis/<REST_API_ID>"
 ```
 
-> **Rule for the future:** every **new API GW** needs this tag before noname
-> will see it. New apps/backends routed through an already-tagged gateway are
-> covered automatically — you tag the *gateway*, not the app. Either bake the
-> tag into CFN (`AWS::ApiGateway::RestApi` → `Tags`) or run the one-liner right
-> after creation.
+### Step 2 — create the log group + allow API Gateway to write
+
+```bash
+LGN="API-Gateway-Execution-Logs_<REST_API_ID>/<STAGE>"
+
+aws logs create-log-group --log-group-name "$LGN"
+
+aws logs put-resource-policy --policy-name 'API-GW-AccessLogs' \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"apigateway.amazonaws.com"},"Action":"logs:PutLogEvents","Resource":"arn:aws:logs:us-east-2:491489166083:log-group:API-Gateway-Execution-Logs_<REST_API_ID>/<STAGE>:*"}]}'
+```
+
+### Step 3 — point the stage's access logs at it (Noname format)
+
+> `update-stage` is **patch-based**. The destination ARN must **not** carry the
+> `:*` suffix (API rejects it), and the format must include Noname's
+> `nonameAccessLogs` field.
+
+```bash
+python3 - <<'PY'
+import json
+fmt = {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","domainName":"$context.domainName","nonameAccessLogs":"$context.requestId,$context.identity.sourceIp,$context.identity.caller,$context.identity.user,$context.requestTime,$context.httpMethod,$context.path,$context.status,$context.protocol,$context.responseLength,$context.domainName,$context.accountId"}
+req = {"restApiId":"<REST_API_ID>","stageName":"<STAGE>","patchOperations":[
+  {"op":"add","path":"/accessLogSettings/destinationArn","value":"arn:aws:logs:us-east-2:491489166083:log-group:API-Gateway-Execution-Logs_<REST_API_ID>/<STAGE>"},
+  {"op":"add","path":"/accessLogSettings/format","value":json.dumps(fmt)}
+]}
+print(json.dumps(req))
+PY > /tmp/update_stage.json
+
+aws apigateway update-stage --cli-input-json file:///tmp/update_stage.json
+```
+
+### Step 4 — forward the log group to Noname (your tenant)
+
+```bash
+aws logs put-subscription-filter \
+  --log-group-name 'API-Gateway-Execution-Logs_<REST_API_ID>/<STAGE>' \
+  --filter-name 'noname-filter' \
+  --filter-pattern '[msg="*Extended Request Id:*" || msg="*Method request headers:*" || msg="*Endpoint response headers:*" || msg="*Method response headers:*" || msg="*Method request body before transformations:*" || msg="*Method response body after transformations:*" || msg="*HTTP Method:*" || msg="*Method completed with status:*" || msg="*Starting execution for request*" || msg="*Successfully completed execution*" || msg="*Verifying Usage Plan for request:*" || msg="*API Stage:*" || msg="*Endpoint request URI:*" || msg="{*" || msg="<*" || msg="*[NONAME]*" || msg="*nonameAccessLogs*"]' \
+  --destination-arn 'arn:aws:logs:us-east-2:491489166083:destination:NonameKinesisCloudWatchLogsDestination-02f9f19d021f' \
+  --role-arn 'arn:aws:iam::491489166083:role/NonameCloudWatchKinesisRole-0ab2ef0fa13d'
+```
+
+### Verify (this gateway: `xuitgw7bpb` / `mcropsey-lab`)
+
+```bash
+aws apigateway get-stage --rest-api-id xuitgw7bpb --stage-name mcropsey-lab --query accessLogSettings
+aws logs describe-subscription-filters --log-group-name 'API-Gateway-Execution-Logs_xuitgw7bpb/mcropsey-lab'
+curl -s -o /dev/null -w '%{http_code}\n' 'https://xuitgw7bpb.execute-api.us-east-2.amazonaws.com/mcropsey-lab/'
+aws logs filter-log-events --log-group-name 'API-Gateway-Execution-Logs_xuitgw7bpb/mcropsey-lab' --query 'events[0].message' --output text
+```
+
+> **Verified working 2026-09-22:** all three steps done for `xuitgw7bpb` /
+> `mcropsey-lab`. A test GET returned HTTP 200 and an access log containing the
+> `nonameAccessLogs` field landed in the log group → forwarded to the
+> `02f9f19d021f` Kinesis tenant. The API should surface in the Noname UI within
+> a few minutes (scanner/processor cadence).
 
 ## AWS CLI commands used to create this
 
@@ -145,12 +215,19 @@ aws apigateway update-rest-api --rest-api-id xuitgw7bpb \
 aws apigateway create-stage --rest-api-id xuitgw7bpb --stage-name mcropsey-lab --deployment-id wu8vmm
 aws apigateway delete-stage --rest-api-id xuitgw7bpb --stage-name lab
 
-# 12. REQUIRED: tag for noname (API Security) to see this gateway.
-#     An untagged gateway is skipped ("Member must have length >= 1").
-#     Tag the API (not the stage); value can be blank.
+# 12. REQUIRED: connect this gateway to Noname (API Security).
+#     This is 3 steps, NOT just the tag — the tag is only the prerequisite.
+#     Full commands are in the "Noname / API Security onboarding — REQUIRED"
+#     section above (tag + accessLogSettings + noname-filter subscription).
+#
+#     (a) tag the API (prerequisite; untagged gateway is skipped,
+#         "Member must have length >= 1"; tag the API not the stage):
 aws apigateway tag-resource \
   --resource-arn "arn:aws:apigateway:us-east-2::/restapis/xuitgw7bpb" \
   --tags '{"inspected-by-noname-security":""}'
+#
+#     (b) log group + accessLogSettings + noname-filter subscription —
+#         run steps 2-4 from the onboarding section. Done 2026-09-22.
 ```
 
 ## Verification (all passed)
@@ -166,4 +243,4 @@ curl https://xuitgw7bpb.execute-api.us-east-2.amazonaws.com/mcropsey-lab/users/v
 - Pattern copied from the existing `alanc-vampi-azure` API (3vn5pqspji) in this account.
 - `0.0.0.0/0 -> 5000` is required for the internet-facing integration; API GW egress IPs are not a fixed CIDR.
 - Deployments can take ~20-60s to propagate; a 403 "Missing Authentication Token" on a path means that resource has no method (normal pre-deploy).
-- **Noname onboarding (added 2026-09-22):** this gateway required the `inspected-by-noname-security` tag (value blank) on the API — not the stage — or noname skips it (`Member must have length greater than or equal to 1`). Every new API GW needs it; a new app behind a tagged gateway does not. See the "Noname / API Security onboarding — REQUIRED" section.
+- **Noname onboarding (updated 2026-09-22):** connecting a gateway to Noname is **3 steps, not just the tag** — (1) `inspected-by-noname-security` tag on the API (prerequisite; untagged gateway is skipped with `Member must have length greater than or equal to 1`), (2) stage `accessLogSettings` with Noname's `nonameAccessLogs` format → a log group, (3) `noname-filter` subscription on that log group → the `02f9f19d021f` Kinesis destination. Tagging alone is **not** enough. Every new API GW needs all three; a new app behind an already-connected gateway does not. Full commands: see the "Noname / API Security onboarding — REQUIRED" section. Verified working 2026-09-22.
